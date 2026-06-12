@@ -1,7 +1,7 @@
 import json
 import os
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List
 
 from google.cloud import storage as gcs_storage
 
@@ -10,6 +10,8 @@ class LeadStore:
     def __init__(self) -> None:
         self.bucket_name = os.getenv("LEADS_BUCKET", "").strip()
         self.local_path = Path(os.getenv("LEADS_LOCAL_PATH", "data/leads.jsonl"))
+        self.local_settings_path = Path(os.getenv("SCAN_SETTINGS_LOCAL_PATH", "data/scan_settings.json"))
+        self.settings_blob_name = os.getenv("SCAN_SETTINGS_BLOB", "config/scan_settings.json")
         self.client = gcs_storage.Client() if self.bucket_name else None
 
     def _gcs_blob_name(self, created_at: str) -> str:
@@ -84,3 +86,34 @@ class LeadStore:
                 except json.JSONDecodeError:
                     continue
         return records
+
+    def save_settings(self, settings: Dict[str, object]) -> None:
+        if self.bucket_name and self.client:
+            bucket = self.client.bucket(self.bucket_name)
+            blob = bucket.blob(self.settings_blob_name)
+            blob.upload_from_string(
+                json.dumps(settings, ensure_ascii=False, indent=2),
+                content_type="application/json; charset=utf-8",
+            )
+            return
+
+        self.local_settings_path.parent.mkdir(parents=True, exist_ok=True)
+        self.local_settings_path.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def load_settings(self) -> Dict[str, object]:
+        if self.bucket_name and self.client:
+            bucket = self.client.bucket(self.bucket_name)
+            blob = bucket.blob(self.settings_blob_name)
+            if not blob.exists():
+                return {}
+            try:
+                return json.loads(blob.download_as_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                return {}
+
+        if not self.local_settings_path.exists():
+            return {}
+        try:
+            return json.loads(self.local_settings_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return {}
