@@ -40,6 +40,7 @@ MAX_POSTS_DEFAULT = int(os.getenv("MAX_POSTS_DEFAULT", "20"))
 SCAN_DELAY_SECONDS = float(os.getenv("SCAN_DELAY_SECONDS", "0"))
 VERIFY_PROXY = os.getenv("VERIFY_PROXY", "false").lower() == "true"
 DEFAULT_TIMEZONE = os.getenv("SCAN_TIMEZONE_DEFAULT", "Asia/Ho_Chi_Minh")
+INGEST_MIN_SCORE_DEFAULT = int(os.getenv("INGEST_MIN_SCORE", "55"))
 USER_AGENT = os.getenv(
     "USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -279,6 +280,14 @@ def load_scan_settings() -> Dict[str, Any]:
     }
 
 
+def normalize_classification_reason(classification: Dict[str, Any]) -> List[str]:
+    reasons = classification.get("reasons")
+    if isinstance(reasons, list):
+        return [str(reason) for reason in reasons if str(reason or "").strip()]
+    reason = str(classification.get("reason", "") or "").strip()
+    return [reason] if reason else []
+
+
 class LeadScraper:
     def __init__(self, user_agent: str, proxy_config: Optional[Dict[str, str]] = None) -> None:
         self.user_agent = user_agent
@@ -486,6 +495,7 @@ def root() -> Any:
             "dashboard_scan": "/dashboard/scan",
             "dashboard_settings": "/dashboard/settings",
             "scheduled_scan": "/scheduled-scan",
+            "ingest_text": "/ingest-text",
             "health": "/health",
             "scan": "/scan",
             "scan_save": "/scan-save",
@@ -534,6 +544,59 @@ def scan_save() -> Any:
     except Exception as exc:
         logger.exception("scan-save failed")
         return jsonify({"status": "error", "message": str(exc)}), 500
+
+
+@app.route("/ingest-text", methods=["POST"])
+def ingest_text() -> Any:
+    auth = require_review_token()
+    if auth:
+        return auth
+
+    data = request.get_json(silent=True) or {}
+    content = clean_text(str(data.get("content", "") or ""))
+    if not content:
+        return jsonify({"status": "error", "message": "content is required."}), 400
+
+    min_score = parse_positive_int(
+        data.get("min_score", INGEST_MIN_SCORE_DEFAULT),
+        INGEST_MIN_SCORE_DEFAULT,
+        minimum=0,
+        maximum=100,
+    )
+    classification = CLASSIFIER.classify_for_ingest(content)
+    category = str(classification.get("category", "") or "").upper()
+    score = parse_min_score(classification.get("score", 0))
+    saved = category == "TARGET" and score >= min_score
+    lead = None
+
+    if saved:
+        lead = {
+            "id": f"lead_{uuid.uuid4().hex}",
+            "created_at": now_iso(),
+            "source_url": str(data.get("url", "") or "").strip(),
+            "author": str(data.get("author", "") or "").strip(),
+            "text": content,
+            "score": score,
+            "intent": str(classification.get("intent", "borrower") or "borrower"),
+            "reasons": normalize_classification_reason(classification),
+            "matched_keywords": classification.get("matched_keywords", []),
+            "suggested_comments": CLASSIFIER.suggest_comments(content),
+            "ai_category": category,
+            "ai_reason": str(classification.get("reason", "") or ""),
+            "classifier": str(classification.get("classifier", "unknown") or "unknown"),
+            "ingested": True,
+        }
+        STORE.append_leads([lead])
+
+    return jsonify(
+        {
+            "status": "success",
+            "saved": saved,
+            "min_score": min_score,
+            "classification": classification,
+            "lead": lead,
+        }
+    )
 
 
 @app.route("/dashboard/scan", methods=["POST"])
