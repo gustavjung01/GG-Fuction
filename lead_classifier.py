@@ -47,6 +47,8 @@ NEGATIVE_LENDER_KEYWORDS = [
     "hỗ trợ nợ xấu",
 ]
 
+URGENT_KEYWORDS = ["gấp", "ngay", "hôm nay", "trong ngày", "cần liền", "đang cần"]
+MONEY_PATTERN = re.compile(r"\b\d+(?:[\.,]\d+)?\s*(?:k|tr|triệu|trieu|m|tỷ|ty|vnđ|vnd|đồng|dong)\b", re.IGNORECASE)
 
 VERTEX_CATEGORY_TO_INTENT = {
     "TARGET": "borrower",
@@ -122,9 +124,16 @@ class LeadClassifier:
         normalized = " ".join((text or "").split()).lower()
         borrower_matches = _match_keywords(normalized, self.borrower_keywords)
         negative_matches = _match_keywords(normalized, self.negative_keywords)
+        urgent_matches = _match_keywords(normalized, URGENT_KEYWORDS)
+        has_money_amount = bool(MONEY_PATTERN.search(normalized))
 
         borrower_score = len(borrower_matches) * 28
         negative_score = len(negative_matches) * 34
+        if borrower_matches:
+            if has_money_amount:
+                borrower_score += 18
+            if urgent_matches:
+                borrower_score += 12
         score = max(0, min(100, borrower_score - negative_score + (12 if borrower_matches else 0)))
 
         reasons: List[str] = []
@@ -141,6 +150,11 @@ class LeadClassifier:
         elif borrower_matches:
             intent = "borrower"
             matched_keywords.extend(borrower_matches)
+            if has_money_amount:
+                reasons.append("Borrower intent includes a money amount.")
+            if urgent_matches:
+                reasons.append("Borrower intent includes urgency.")
+                matched_keywords.extend([keyword for keyword in urgent_matches if keyword not in matched_keywords])
             if negative_matches:
                 reasons.append("Borrower intent is present, but some lender-like phrases also appear.")
                 reasons.extend(f"negative:{keyword}" for keyword in negative_matches)
@@ -155,6 +169,7 @@ class LeadClassifier:
                 reasons.extend(f"negative:{keyword}" for keyword in negative_matches)
                 matched_keywords.extend(negative_matches)
             else:
+                intent = "trash"
                 reasons.append("No strong borrower intent detected.")
 
         if intent == "borrower" and negative_matches and negative_score > 0:
@@ -208,14 +223,16 @@ class LeadClassifier:
     def classify_with_vertex(self, text: str) -> Dict[str, object]:
         model = self._get_vertex_model()
         prompt = PROMPT_TEMPLATE.format(text=(text or "").strip())
-        response = model.generate_content(
-            prompt,
-            generation_config=GenerationConfig(
+        try:
+            generation_config = GenerationConfig(
                 temperature=0,
                 max_output_tokens=512,
                 response_mime_type="application/json",
-            ),
-        )
+            )
+        except TypeError:
+            generation_config = GenerationConfig(temperature=0, max_output_tokens=512)
+
+        response = model.generate_content(prompt, generation_config=generation_config)
         parsed = _extract_json_payload(getattr(response, "text", "") or "")
         category = str(parsed.get("category", "TRASH") or "TRASH").strip().upper()
         if category not in {"TARGET", "SPAM", "TRASH"}:
