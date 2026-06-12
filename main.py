@@ -5,14 +5,18 @@ import os
 import re
 import time
 import uuid
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib.parse import urlencode
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from flask import Flask, Response, jsonify, request, render_template_string
+from flask import Flask, Response, jsonify, redirect, request, render_template_string
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover - Python < 3.9 fallback
+    ZoneInfo = None  # type: ignore
 
 from lead_classifier import LeadClassifier
 from storage import LeadStore
@@ -35,6 +39,7 @@ SCAN_DEFAULT_URLS = [
 MAX_POSTS_DEFAULT = int(os.getenv("MAX_POSTS_DEFAULT", "20"))
 SCAN_DELAY_SECONDS = float(os.getenv("SCAN_DELAY_SECONDS", "0"))
 VERIFY_PROXY = os.getenv("VERIFY_PROXY", "false").lower() == "true"
+DEFAULT_TIMEZONE = os.getenv("SCAN_TIMEZONE_DEFAULT", "Asia/Ho_Chi_Minh")
 USER_AGENT = os.getenv(
     "USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -70,12 +75,61 @@ def clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
+def split_text_lines(raw: Any) -> List[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        values = re.split(r"[\n,]+", raw)
+    elif isinstance(raw, Iterable):
+        values = list(raw)
+    else:
+        values = [raw]
+    return [str(value).strip() for value in values if str(value or "").strip()]
+
+
 def normalize_urls(urls: Optional[Iterable[str]]) -> List[str]:
     if not urls:
         return list(SCAN_DEFAULT_URLS)
     if isinstance(urls, str):
         urls = [urls]
     return [url.strip() for url in urls if isinstance(url, str) and url.strip()]
+
+
+def normalize_group_value(raw: str) -> Optional[str]:
+    value = clean_text(raw)
+    if not value:
+        return None
+
+    if value.startswith(("http://", "https://")):
+        return value
+
+    value = value.strip("/")
+    group_match = re.search(r"(?:^|/)groups/([^/?#]+)", value)
+    if group_match:
+        value = group_match.group(1)
+
+    if value.startswith("www.facebook.com/groups/") or value.startswith("facebook.com/groups/"):
+        return "https://" + value
+
+    value = value.split("?", 1)[0].split("#", 1)[0].strip("/")
+    if not value:
+        return None
+    return f"https://www.facebook.com/groups/{value}"
+
+
+def normalize_group_inputs(raw: Any) -> List[str]:
+    urls: List[str] = []
+    seen = set()
+    for value in split_text_lines(raw):
+        url = normalize_group_value(value)
+        if not url:
+            continue
+        key = url.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        urls.append(url)
+    return urls
 
 
 def parse_date_filter(raw: str) -> Optional[str]:
@@ -116,8 +170,72 @@ def parse_bool(raw: Any, default: bool = False) -> bool:
     return default
 
 
+def parse_time_windows(raw: Any) -> List[str]:
+    return split_text_lines(raw)
+
+
+def parse_time_window_minutes(window: str) -> Optional[Tuple[int, int]]:
+    match = re.match(r"^\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*$", window or "")
+    if not match:
+        return None
+
+    start_hour, start_minute, end_hour, end_minute = [int(part) for part in match.groups()]
+    if not (0 <= start_hour <= 23 and 0 <= end_hour <= 23 and 0 <= start_minute <= 59 and 0 <= end_minute <= 59):
+        return None
+
+    return start_hour * 60 + start_minute, end_hour * 60 + end_minute
+
+
+def get_timezone(timezone_name: str):
+    timezone_name = (timezone_name or DEFAULT_TIMEZONE).strip() or DEFAULT_TIMEZONE
+    if ZoneInfo is None:
+        return timezone.utc, "UTC"
+    try:
+        return ZoneInfo(timezone_name), timezone_name
+    except Exception:
+        logger.warning("Invalid timezone %s; falling back to %s", timezone_name, DEFAULT_TIMEZONE)
+        try:
+            return ZoneInfo(DEFAULT_TIMEZONE), DEFAULT_TIMEZONE
+        except Exception:
+            return timezone.utc, "UTC"
+
+
+def is_inside_time_windows(time_windows: Sequence[str], timezone_name: str) -> Tuple[bool, str, str]:
+    parsed_windows = []
+    for window in time_windows:
+        parsed = parse_time_window_minutes(window)
+        if parsed:
+            parsed_windows.append((window, parsed))
+
+    tzinfo, resolved_timezone = get_timezone(timezone_name)
+    now_local = datetime.now(tzinfo)
+    now_minutes = now_local.hour * 60 + now_local.minute
+
+    if not parsed_windows:
+        return False, "No valid time windows configured.", resolved_timezone
+
+    for label, (start_minutes, end_minutes) in parsed_windows:
+        if start_minutes <= end_minutes:
+            if start_minutes <= now_minutes <= end_minutes:
+                return True, f"Inside time window {label}.", resolved_timezone
+        else:
+            if now_minutes >= start_minutes or now_minutes <= end_minutes:
+                return True, f"Inside overnight time window {label}.", resolved_timezone
+
+    return False, f"Outside configured time windows at {now_local.strftime('%H:%M')} {resolved_timezone}.", resolved_timezone
+
+
 def extract_token() -> str:
-    return (request.args.get("token") or request.headers.get("X-Review-Token") or "").strip()
+    token = (
+        request.args.get("token")
+        or request.headers.get("X-Review-Token")
+        or request.form.get("token")
+        or ""
+    )
+    if not token and request.is_json:
+        data = request.get_json(silent=True) or {}
+        token = str(data.get("token", "") or "")
+    return str(token).strip()
 
 
 def token_required() -> bool:
@@ -130,6 +248,35 @@ def require_review_token():
     if REVIEW_TOKEN and not token_required():
         return jsonify({"status": "error", "message": "Unauthorized"}), 401
     return None
+
+
+def dashboard_redirect(message: str, level: str = "success") -> Response:
+    params = {}
+    token = extract_token()
+    if token:
+        params["token"] = token
+    if message:
+        params["message"] = message
+    if level:
+        params["level"] = level
+    location = "/dashboard"
+    if params:
+        location += "?" + urlencode(params)
+    return redirect(location)
+
+
+def load_scan_settings() -> Dict[str, Any]:
+    stored = STORE.load_settings() or {}
+    groups = stored.get("groups", [])
+    time_windows = stored.get("time_windows", [])
+    return {
+        "groups": normalize_group_inputs(groups),
+        "time_windows": parse_time_windows(time_windows),
+        "max_posts": parse_positive_int(stored.get("max_posts", MAX_POSTS_DEFAULT), MAX_POSTS_DEFAULT),
+        "include_comments": parse_bool(stored.get("include_comments"), False),
+        "enabled": parse_bool(stored.get("enabled"), False),
+        "timezone": str(stored.get("timezone") or DEFAULT_TIMEZONE).strip() or DEFAULT_TIMEZONE,
+    }
 
 
 class LeadScraper:
@@ -336,6 +483,9 @@ def root() -> Any:
         {
             "status": "ok",
             "dashboard": "/dashboard",
+            "dashboard_scan": "/dashboard/scan",
+            "dashboard_settings": "/dashboard/settings",
+            "scheduled_scan": "/scheduled-scan",
             "health": "/health",
             "scan": "/scan",
             "scan_save": "/scan-save",
@@ -386,6 +536,97 @@ def scan_save() -> Any:
         return jsonify({"status": "error", "message": str(exc)}), 500
 
 
+@app.route("/dashboard/scan", methods=["POST"])
+def dashboard_scan() -> Response:
+    auth = require_review_token()
+    if auth:
+        return auth
+
+    urls = normalize_group_inputs(request.form.get("groups", ""))
+    if not urls:
+        return dashboard_redirect("Please enter at least one Facebook group UID, slug, or link.", "error")
+
+    max_posts = parse_positive_int(request.form.get("max_posts", MAX_POSTS_DEFAULT), MAX_POSTS_DEFAULT)
+    include_comments = parse_bool(request.form.get("include_comments"), False)
+
+    try:
+        response = build_scan_response(urls, max_posts, include_comments, save=True)
+        message = (
+            f"Scan complete: visited {len(response.get('visited_urls', []))} group(s), "
+            f"scanned {response.get('scanned_count', 0)} item(s), "
+            f"saved {response.get('saved_count', 0)} lead(s)."
+        )
+        return dashboard_redirect(message, "success")
+    except PlaywrightTimeoutError:
+        return dashboard_redirect("Scan failed: timeout while loading a group.", "error")
+    except Exception as exc:
+        logger.exception("dashboard scan failed")
+        return dashboard_redirect(f"Scan failed: {exc}", "error")
+
+
+@app.route("/dashboard/settings", methods=["POST"])
+def dashboard_settings() -> Response:
+    auth = require_review_token()
+    if auth:
+        return auth
+
+    settings = {
+        "groups": normalize_group_inputs(request.form.get("groups", "")),
+        "time_windows": parse_time_windows(request.form.get("time_windows", "")),
+        "max_posts": parse_positive_int(request.form.get("max_posts", MAX_POSTS_DEFAULT), MAX_POSTS_DEFAULT),
+        "include_comments": parse_bool(request.form.get("include_comments"), False),
+        "enabled": parse_bool(request.form.get("enabled"), False),
+        "timezone": (request.form.get("timezone") or DEFAULT_TIMEZONE).strip() or DEFAULT_TIMEZONE,
+        "updated_at": now_iso(),
+    }
+    STORE.save_settings(settings)
+    return dashboard_redirect("Scheduled scan settings saved.", "success")
+
+
+@app.route("/scheduled-scan", methods=["POST"])
+def scheduled_scan() -> Any:
+    auth = require_review_token()
+    if auth:
+        return auth
+
+    settings = load_scan_settings()
+    if not settings["enabled"]:
+        return jsonify({"status": "skipped", "reason": "Scheduled scan is disabled.", "settings": settings})
+
+    urls = normalize_group_inputs(settings.get("groups", []))
+    if not urls:
+        return jsonify({"status": "skipped", "reason": "No groups configured.", "settings": settings})
+
+    inside_window, reason, resolved_timezone = is_inside_time_windows(
+        settings.get("time_windows", []),
+        str(settings.get("timezone") or DEFAULT_TIMEZONE),
+    )
+    if not inside_window:
+        return jsonify(
+            {
+                "status": "skipped",
+                "reason": reason,
+                "timezone": resolved_timezone,
+                "time_windows": settings.get("time_windows", []),
+            }
+        )
+
+    max_posts = parse_positive_int(settings.get("max_posts", MAX_POSTS_DEFAULT), MAX_POSTS_DEFAULT)
+    include_comments = parse_bool(settings.get("include_comments"), False)
+
+    try:
+        response = build_scan_response(urls, max_posts, include_comments, save=True)
+        response["scheduled"] = True
+        response["schedule_reason"] = reason
+        response["timezone"] = resolved_timezone
+        return jsonify(response)
+    except PlaywrightTimeoutError:
+        return jsonify({"status": "error", "message": "Timeout while loading page."}), 504
+    except Exception as exc:
+        logger.exception("scheduled scan failed")
+        return jsonify({"status": "error", "message": str(exc)}), 500
+
+
 @app.route("/suggest-comments", methods=["POST"])
 def suggest_comments() -> Any:
     data = request.get_json(silent=True) or {}
@@ -433,6 +674,7 @@ def dashboard() -> Response:
     date_filter = parse_date_filter(request.args.get("date", ""))
     all_leads = load_dashboard_leads()
     leads = filter_dashboard_leads(all_leads, min_score=min_score, date_filter=date_filter)
+    settings = load_scan_settings()
 
     export_params = {}
     token = extract_token()
@@ -465,6 +707,7 @@ def dashboard() -> Response:
               --muted: #94a3b8;
               --accent: #38bdf8;
               --accent-2: #22c55e;
+              --danger: #fb7185;
               --border: #334155;
             }
             body {
@@ -480,18 +723,23 @@ def dashboard() -> Response:
               border-radius: 16px;
               box-shadow: 0 12px 30px rgba(0,0,0,.25);
             }
-            .hero { padding: 20px; margin-bottom: 18px; }
+            .hero, .panel { padding: 20px; margin-bottom: 18px; }
             .meta { color: var(--muted); margin-top: 6px; }
             .grid { display: grid; gap: 16px; }
-            .filters { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; }
+            .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+            .filters, .form-row { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; }
             label { display: grid; gap: 6px; font-size: 14px; color: var(--muted); }
-            input {
+            input, textarea, select {
               background: #0b1220;
               color: var(--text);
               border: 1px solid var(--border);
               border-radius: 10px;
               padding: 10px 12px;
             }
+            textarea { min-height: 104px; resize: vertical; }
+            .wide { width: 100%; }
+            .check { display: flex; align-items: center; gap: 8px; color: var(--muted); }
+            .check input { width: auto; }
             .btn, a.btn {
               display: inline-block;
               border: 0;
@@ -502,6 +750,19 @@ def dashboard() -> Response:
               text-decoration: none;
               font-weight: 700;
               cursor: pointer;
+            }
+            .btn.secondary { background: #a78bfa; color: #160b2f; }
+            .message {
+              padding: 12px 14px;
+              border-radius: 12px;
+              border: 1px solid var(--border);
+              margin-bottom: 18px;
+              background: rgba(34, 197, 94, .12);
+              color: #bbf7d0;
+            }
+            .message.error {
+              background: rgba(251, 113, 133, .12);
+              color: #fecdd3;
             }
             .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin: 14px 0; }
             .stat { padding: 14px; background: var(--card); border: 1px solid var(--border); border-radius: 14px; }
@@ -527,6 +788,10 @@ def dashboard() -> Response:
         </head>
         <body>
           <div class="wrap">
+            {% if message %}
+            <div class="message {{ message_level }}">{{ message }}</div>
+            {% endif %}
+
             <div class="hero">
               <h1>Lead Scanner Dashboard</h1>
               <div class="meta">Manual review only. No Facebook posting actions are available.</div>
@@ -546,6 +811,60 @@ def dashboard() -> Response:
                 <button class="btn" type="submit">Apply</button>
                 <a class="btn" href="{{ export_link }}">Export CSV</a>
               </form>
+            </div>
+
+            <div class="form-grid">
+              <div class="panel">
+                <h2>Manual Scan</h2>
+                <div class="meta">Paste one Facebook group UID, slug, or link per line.</div>
+                <form method="post" action="/dashboard/scan" class="grid">
+                  {% if token %}<input type="hidden" name="token" value="{{ token }}">{% endif %}
+                  <label>Groups
+                    <textarea name="groups" class="wide" placeholder="123456789012345&#10;vayvonkinhdoanh">{{ settings_groups_text }}</textarea>
+                  </label>
+                  <div class="form-row">
+                    <label>Max posts
+                      <input type="number" name="max_posts" min="1" max="1000" value="{{ settings.max_posts }}">
+                    </label>
+                    <label class="check">
+                      <input type="checkbox" name="include_comments" value="1" {% if settings.include_comments %}checked{% endif %}>
+                      Include comments
+                    </label>
+                    <button class="btn" type="submit">Scan &amp; Save</button>
+                  </div>
+                </form>
+              </div>
+
+              <div class="panel">
+                <h2>Scheduled Scan Settings</h2>
+                <div class="meta">Use Cloud Scheduler to POST /scheduled-scan with X-Review-Token.</div>
+                <form method="post" action="/dashboard/settings" class="grid">
+                  {% if token %}<input type="hidden" name="token" value="{{ token }}">{% endif %}
+                  <label>Groups
+                    <textarea name="groups" class="wide" placeholder="123456789012345&#10;https://www.facebook.com/groups/my-group">{{ settings_groups_text }}</textarea>
+                  </label>
+                  <label>Time windows
+                    <textarea name="time_windows" class="wide" placeholder="08:00-11:30&#10;13:30-17:00">{{ settings_time_windows_text }}</textarea>
+                  </label>
+                  <div class="form-row">
+                    <label>Max posts
+                      <input type="number" name="max_posts" min="1" max="1000" value="{{ settings.max_posts }}">
+                    </label>
+                    <label>Timezone
+                      <input type="text" name="timezone" value="{{ settings.timezone }}" placeholder="Asia/Ho_Chi_Minh">
+                    </label>
+                    <label class="check">
+                      <input type="checkbox" name="include_comments" value="1" {% if settings.include_comments %}checked{% endif %}>
+                      Include comments
+                    </label>
+                    <label class="check">
+                      <input type="checkbox" name="enabled" value="1" {% if settings.enabled %}checked{% endif %}>
+                      Enabled
+                    </label>
+                    <button class="btn secondary" type="submit">Save Settings</button>
+                  </div>
+                </form>
+              </div>
             </div>
 
             <div class="grid">
@@ -599,6 +918,11 @@ def dashboard() -> Response:
         date_filter=date_filter or "",
         export_link=export_link,
         token=token,
+        settings=settings,
+        settings_groups_text="\n".join(settings.get("groups", [])),
+        settings_time_windows_text="\n".join(settings.get("time_windows", [])),
+        message=request.args.get("message", ""),
+        message_level=request.args.get("level", ""),
     )
     return Response(dashboard_html, mimetype="text/html")
 
