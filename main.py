@@ -1,4 +1,3 @@
-import base64
 import csv
 import io
 import logging
@@ -23,6 +22,7 @@ from lead_classifier import LeadClassifier
 from storage import LeadStore
 
 app = Flask(__name__)
+app.config["LAST_SCAN_DEBUG"] = None
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 logger = logging.getLogger(__name__)
@@ -132,32 +132,6 @@ def normalize_group_inputs(raw: Any) -> List[str]:
         seen.add(key)
         urls.append(url)
     return urls
-
-
-def parse_raw_cookie_string(cookie_str: str) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    """Parses a raw Facebook cookie string into Playwright format."""
-    cookies = []
-    user_agent = None
-
-    # Split by semicolon
-    parts = [p.strip() for p in cookie_str.split(";") if p.strip()]
-    for part in parts:
-        if "=" not in part:
-            continue
-        name, value = part.split("=", 1)
-        if name.lower() == "useragent":
-            try:
-                user_agent = base64.b64decode(value).decode("utf-8")
-            except Exception:
-                pass
-            continue
-
-        cookies.append({
-            "name": name, "value": value,
-            "domain": ".facebook.com", "path": "/",
-            "secure": True, "httpOnly": False, "sameSite": "Lax"
-        })
-    return cookies, user_agent
 
 
 def parse_date_filter(raw: str) -> Optional[str]:
@@ -300,7 +274,6 @@ def load_scan_settings() -> Dict[str, Any]:
     return {
         "groups": normalize_group_inputs(groups),
         "time_windows": parse_time_windows(time_windows),
-        "accounts": split_text_lines(stored.get("accounts", [])),
         "max_posts": parse_positive_int(stored.get("max_posts", MAX_POSTS_DEFAULT), MAX_POSTS_DEFAULT),
         "include_comments": parse_bool(stored.get("include_comments"), False),
         "enabled": parse_bool(stored.get("enabled"), False),
@@ -316,34 +289,86 @@ def normalize_classification_reason(classification: Dict[str, Any]) -> List[str]
     return [reason] if reason else []
 
 
+def classification_category(classification: Dict[str, Any]) -> str:
+    category = str(classification.get("category", "") or "").upper()
+    if category in {"TARGET", "SPAM", "TRASH"}:
+        return category
+    intent = str(classification.get("intent", "") or "").lower()
+    if intent == "borrower":
+        return "TARGET"
+    if intent == "lender":
+        return "SPAM"
+    return "TRASH"
+
+
+def classification_reason_text(classification: Dict[str, Any]) -> str:
+    reasons = normalize_classification_reason(classification)
+    return "; ".join(reasons)
+
+
+def build_lead_record(item: Dict[str, Any], text: str, classification: Dict[str, Any], category: str, score: int) -> Dict[str, Any]:
+    return {
+        "id": f"lead_{uuid.uuid4().hex}",
+        "created_at": now_iso(),
+        "source_url": item.get("source_url", ""),
+        "author": item.get("author", ""),
+        "text": text,
+        "score": score,
+        "intent": str(classification.get("intent", "borrower") or "borrower"),
+        "reasons": normalize_classification_reason(classification),
+        "matched_keywords": classification.get("matched_keywords", []),
+        "suggested_comments": CLASSIFIER.suggest_comments(text),
+        "ai_category": category,
+        "ai_reason": str(classification.get("reason", "") or classification_reason_text(classification)),
+        "classifier": str(classification.get("classifier", "unknown") or "unknown"),
+        "selector": item.get("selector", ""),
+        "ingested": False,
+    }
+
+
+def build_scan_debug_item(
+    item: Dict[str, Any],
+    text: str,
+    classification: Dict[str, Any],
+    category: str,
+    score: int,
+    saved: bool,
+    lead: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    return {
+        "raw_text": text,
+        "text": text,
+        "source_url": item.get("source_url", ""),
+        "selector": item.get("selector", ""),
+        "ai_category": category,
+        "category": category,
+        "score": score,
+        "reason": str(classification.get("reason", "") or classification_reason_text(classification)),
+        "intent": str(classification.get("intent", "") or ""),
+        "matched_keywords": classification.get("matched_keywords", []),
+        "classifier": str(classification.get("classifier", "unknown") or "unknown"),
+        "saved": saved,
+        "lead_id": lead.get("id") if lead else "",
+        "classification": classification,
+    }
+
+
 class LeadScraper:
     def __init__(self, user_agent: str, proxy_config: Optional[Dict[str, str]] = None) -> None:
         self.user_agent = user_agent
         self.proxy_config = proxy_config
 
-    def _launch(self, cookie_str: Optional[str] = None):
+    def _launch(self):
         playwright = sync_playwright().start()
         browser = playwright.chromium.launch(
             headless=True,
             args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
         )
-
-        ua = self.user_agent
-        init_cookies = []
-        if cookie_str:
-            parsed_cookies, custom_ua = parse_raw_cookie_string(cookie_str)
-            init_cookies = parsed_cookies
-            if custom_ua:
-                ua = custom_ua
-
         context = browser.new_context(
-            user_agent=ua,
+            user_agent=self.user_agent,
             viewport={"width": 1366, "height": 768},
             proxy=self.proxy_config,
         )
-        if init_cookies:
-            context.add_cookies(init_cookies)
-
         page = context.new_page()
         return playwright, browser, context, page
 
@@ -401,12 +426,12 @@ class LeadScraper:
                 blocks.append({"selector": selector, "text": text})
         return self._dedupe(blocks)
 
-    def scrape(self, urls: Sequence[str], max_posts: int, include_comments: bool, cookie_str: Optional[str] = None) -> Dict[str, Any]:
+    def scrape(self, urls: Sequence[str], max_posts: int, include_comments: bool) -> Dict[str, Any]:
         results: List[Dict[str, Any]] = []
         visited_urls: List[str] = []
         ip_info: Optional[Dict[str, Any]] = None
         errors: List[Dict[str, str]] = []
-        playwright, browser, context, page = self._launch(cookie_str=cookie_str)
+        playwright, browser, context, page = self._launch()
 
         if VERIFY_PROXY:
             try:
@@ -417,8 +442,8 @@ class LeadScraper:
         try:
             for index, url in enumerate(urls, start=1):
                 try:
-                    logger.info("Scraping URL: %s", url)
-                    page.goto(url, wait_until="networkidle", timeout=60000)
+                    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                    page.wait_for_timeout(5000)
                     for _ in range(2):
                         page.mouse.wheel(0, 2200)
                         page.wait_for_timeout(2500)
@@ -456,42 +481,41 @@ class LeadScraper:
 SCRAPER = LeadScraper(user_agent=USER_AGENT, proxy_config=build_proxy_config())
 
 
-def classify_and_enrich(items: Sequence[Dict[str, Any]], save: bool = False) -> List[Dict[str, Any]]:
+def classify_and_enrich(items: Sequence[Dict[str, Any]], save: bool = False) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     enriched: List[Dict[str, Any]] = []
+    scanned_items_debug: List[Dict[str, Any]] = []
     for item in items:
         text = clean_text(item.get("text", ""))
         if not text:
             continue
-        classification = CLASSIFIER.classify(text)
-        if not classification["is_lead"] or classification["intent"] != "borrower":
-            continue
 
-        lead_record = {
-            "id": f"lead_{uuid.uuid4().hex}",
-            "created_at": now_iso(),
-            "source_url": item.get("source_url", ""),
-            "text": text,
-            "score": classification["score"],
-            "intent": classification["intent"],
-            "reasons": classification["reasons"],
-            "matched_keywords": classification["matched_keywords"],
-            "suggested_comments": CLASSIFIER.suggest_comments(text),
-        }
-        enriched.append(lead_record)
+        classification = CLASSIFIER.classify_for_ingest(text)
+        category = classification_category(classification)
+        score = parse_min_score(classification.get("score", 0))
+        saved = category == "TARGET" and score >= INGEST_MIN_SCORE_DEFAULT
+        lead_record = None
+
+        if saved:
+            lead_record = build_lead_record(item, text, classification, category, score)
+            enriched.append(lead_record)
+
+        scanned_items_debug.append(build_scan_debug_item(item, text, classification, category, score, saved, lead_record))
+
     if save and enriched:
         STORE.append_leads(enriched)
-    return enriched
+    return enriched, scanned_items_debug
 
 
-def build_scan_response(urls: Sequence[str], max_posts: int, include_comments: bool, save: bool = False, accounts: Optional[List[str]] = None) -> Dict[str, Any]:
-    import random
-    cookie_str = None
-    if accounts:
-        cookie_str = random.choice(accounts)
-        logger.info("Using a random account from the provided list.")
-
-    scraped = SCRAPER.scrape(urls=urls, max_posts=max_posts, include_comments=include_comments, cookie_str=cookie_str)
-    leads = classify_and_enrich(scraped["items"], save=save)
+def build_scan_response(
+    urls: Sequence[str],
+    max_posts: int,
+    include_comments: bool,
+    save: bool = False,
+    debug: bool = False,
+) -> Dict[str, Any]:
+    scraped = SCRAPER.scrape(urls=urls, max_posts=max_posts, include_comments=include_comments)
+    leads, scanned_items_debug = classify_and_enrich(scraped["items"], save=save)
+    rejected_items = [item for item in scanned_items_debug if not item.get("saved")]
     response: Dict[str, Any] = {
         "status": "success",
         "visited_urls": scraped["visited_urls"],
@@ -500,12 +524,18 @@ def build_scan_response(urls: Sequence[str], max_posts: int, include_comments: b
         "scanned_count": len(scraped["items"]),
         "lead_count": len(leads),
         "leads": leads,
+        "scanned_items_debug": scanned_items_debug,
+        "rejected_items": rejected_items,
         "summary": {
             "borrower_leads": len(leads),
             "saved_leads": len(leads) if save else 0,
+            "rejected_items": len(rejected_items),
             "error_count": len(scraped["errors"]),
         },
     }
+    if debug:
+        response["raw_scraped_items"] = scraped["items"]
+        response["classification_debug"] = scanned_items_debug
     if save:
         response["saved_count"] = len(leads)
     return response
@@ -562,8 +592,9 @@ def scan() -> Any:
     urls = normalize_urls(data.get("urls"))
     max_posts = parse_positive_int(data.get("max_posts", MAX_POSTS_DEFAULT), MAX_POSTS_DEFAULT)
     include_comments = parse_bool(data.get("include_comments", False))
+    debug = parse_bool(data.get("debug", request.args.get("debug")), False)
     try:
-        return jsonify(build_scan_response(urls, max_posts, include_comments, save=False))
+        return jsonify(build_scan_response(urls, max_posts, include_comments, save=False, debug=debug))
     except PlaywrightTimeoutError:
         return jsonify({"status": "error", "message": "Timeout while loading page."}), 504
     except Exception as exc:
@@ -581,9 +612,10 @@ def scan_save() -> Any:
     urls = normalize_urls(data.get("urls"))
     max_posts = parse_positive_int(data.get("max_posts", MAX_POSTS_DEFAULT), MAX_POSTS_DEFAULT)
     include_comments = parse_bool(data.get("include_comments", False))
+    debug = parse_bool(data.get("debug", request.args.get("debug")), False)
 
     try:
-        response = build_scan_response(urls, max_posts, include_comments, save=True)
+        response = build_scan_response(urls, max_posts, include_comments, save=True, debug=debug)
         return jsonify(response)
     except PlaywrightTimeoutError:
         return jsonify({"status": "error", "message": "Timeout while loading page."}), 504
@@ -651,22 +683,28 @@ def dashboard_scan() -> Response:
     if auth:
         return auth
 
-    settings = load_scan_settings()
     urls = normalize_group_inputs(request.form.get("groups", ""))
     if not urls:
         return dashboard_redirect("Please enter at least one Facebook group UID, slug, or link.", "error")
-
-    accounts = settings.get("accounts", [])
 
     max_posts = parse_positive_int(request.form.get("max_posts", MAX_POSTS_DEFAULT), MAX_POSTS_DEFAULT)
     include_comments = parse_bool(request.form.get("include_comments"), False)
 
     try:
-        response = build_scan_response(urls, max_posts, include_comments, save=True, accounts=accounts)
+        response = build_scan_response(urls, max_posts, include_comments, save=True, debug=True)
+        app.config["LAST_SCAN_DEBUG"] = {
+            "created_at": now_iso(),
+            "visited_urls": response.get("visited_urls", []),
+            "scanned_count": response.get("scanned_count", 0),
+            "saved_count": response.get("saved_count", 0),
+            "rejected_count": len(response.get("rejected_items", [])),
+            "items": response.get("scanned_items_debug", []),
+        }
         message = (
             f"Scan complete: visited {len(response.get('visited_urls', []))} group(s), "
             f"scanned {response.get('scanned_count', 0)} item(s), "
-            f"saved {response.get('saved_count', 0)} lead(s)."
+            f"saved {response.get('saved_count', 0)} lead(s), "
+            f"rejected {len(response.get('rejected_items', []))} item(s)."
         )
         return dashboard_redirect(message, "success")
     except PlaywrightTimeoutError:
@@ -685,7 +723,6 @@ def dashboard_settings() -> Response:
     settings = {
         "groups": normalize_group_inputs(request.form.get("groups", "")),
         "time_windows": parse_time_windows(request.form.get("time_windows", "")),
-        "accounts": split_text_lines(request.form.get("accounts", "")),
         "max_posts": parse_positive_int(request.form.get("max_posts", MAX_POSTS_DEFAULT), MAX_POSTS_DEFAULT),
         "include_comments": parse_bool(request.form.get("include_comments"), False),
         "enabled": parse_bool(request.form.get("enabled"), False),
@@ -728,7 +765,7 @@ def scheduled_scan() -> Any:
     include_comments = parse_bool(settings.get("include_comments"), False)
 
     try:
-        response = build_scan_response(urls, max_posts, include_comments, save=True, accounts=settings.get("accounts"))
+        response = build_scan_response(urls, max_posts, include_comments, save=True, debug=True)
         response["scheduled"] = True
         response["schedule_reason"] = reason
         response["timezone"] = resolved_timezone
@@ -788,6 +825,8 @@ def dashboard() -> Response:
     all_leads = load_dashboard_leads()
     leads = filter_dashboard_leads(all_leads, min_score=min_score, date_filter=date_filter)
     settings = load_scan_settings()
+    last_scan_debug = app.config.get("LAST_SCAN_DEBUG") or {}
+    scan_debug_items = last_scan_debug.get("items", []) if isinstance(last_scan_debug, dict) else []
 
     export_params = {}
     token = extract_token()
@@ -884,6 +923,8 @@ def dashboard() -> Response:
             .lead + .lead { margin-top: 14px; }
             .lead-head { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
             .pill { display: inline-block; padding: 4px 10px; border-radius: 999px; background: rgba(56,189,248,.15); color: #7dd3fc; }
+            .pill.saved { background: rgba(34,197,94,.15); color: #86efac; }
+            .pill.rejected { background: rgba(251,113,133,.15); color: #fecdd3; }
             pre {
               white-space: pre-wrap;
               word-break: break-word;
@@ -897,6 +938,11 @@ def dashboard() -> Response:
             .comment-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
             .copy { background: #22c55e; color: #052e16; }
             .muted { color: var(--muted); }
+            .debug-wrap { margin-top: 18px; overflow-x: auto; }
+            .debug-table { width: 100%; border-collapse: collapse; min-width: 980px; }
+            .debug-table th, .debug-table td { border-top: 1px solid var(--border); padding: 10px; vertical-align: top; text-align: left; }
+            .debug-table th { color: var(--muted); font-size: 13px; }
+            .debug-table pre { max-height: 180px; margin: 0; }
           </style>
         </head>
         <body>
@@ -929,7 +975,7 @@ def dashboard() -> Response:
             <div class="form-grid">
               <div class="panel">
                 <h2>Manual Scan</h2>
-                <div class="meta">Paste one Facebook group UID, slug, or link per line.</div>
+                <div class="meta">Paste one Facebook group UID, slug, or link per line. Results below show every scanned item, saved or rejected.</div>
                 <form method="post" action="/dashboard/scan" class="grid">
                   {% if token %}<input type="hidden" name="token" value="{{ token }}">{% endif %}
                   <label>Groups
@@ -946,6 +992,47 @@ def dashboard() -> Response:
                     <button class="btn" type="submit">Scan &amp; Save</button>
                   </div>
                 </form>
+
+                {% if scan_debug_items %}
+                <div class="debug-wrap">
+                  <h3>Debug Scanned Items</h3>
+                  <div class="meta">
+                    Last scan: scanned {{ last_scan_debug.scanned_count }}, saved {{ last_scan_debug.saved_count }}, rejected {{ last_scan_debug.rejected_count }}.
+                  </div>
+                  <table class="debug-table">
+                    <thead>
+                      <tr>
+                        <th>Saved</th>
+                        <th>AI Category</th>
+                        <th>Score</th>
+                        <th>Reason</th>
+                        <th>Source URL</th>
+                        <th>Selector</th>
+                        <th>Raw Text</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {% for item in scan_debug_items %}
+                      <tr>
+                        <td>
+                          {% if item.saved %}
+                          <span class="pill saved">true</span>
+                          {% else %}
+                          <span class="pill rejected">false</span>
+                          {% endif %}
+                        </td>
+                        <td>{{ item.ai_category }}</td>
+                        <td>{{ item.score }}</td>
+                        <td>{{ item.reason }}</td>
+                        <td>{{ item.source_url }}</td>
+                        <td>{{ item.selector }}</td>
+                        <td><pre>{{ item.raw_text }}</pre></td>
+                      </tr>
+                      {% endfor %}
+                    </tbody>
+                  </table>
+                </div>
+                {% endif %}
               </div>
 
               <div class="panel">
@@ -958,9 +1045,6 @@ def dashboard() -> Response:
                   </label>
                   <label>Time windows
                     <textarea name="time_windows" class="wide" placeholder="08:00-11:30&#10;13:30-17:00">{{ settings_time_windows_text }}</textarea>
-                  </label>
-                  <label>Accounts (Cookie Strings - one per line)
-                    <textarea name="accounts" class="wide" placeholder="c_user=...; xs=...; useragent=...">{{ settings_accounts_text }}</textarea>
                   </label>
                   <div class="form-row">
                     <label>Max posts
@@ -1037,9 +1121,10 @@ def dashboard() -> Response:
         settings=settings,
         settings_groups_text="\n".join(settings.get("groups", [])),
         settings_time_windows_text="\n".join(settings.get("time_windows", [])),
-        settings_accounts_text="\n".join(settings.get("accounts", [])),
         message=request.args.get("message", ""),
         message_level=request.args.get("level", ""),
+        last_scan_debug=last_scan_debug,
+        scan_debug_items=scan_debug_items,
     )
     return Response(dashboard_html, mimetype="text/html")
 
