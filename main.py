@@ -1,3 +1,4 @@
+import base64
 import csv
 import io
 import logging
@@ -132,6 +133,41 @@ def normalize_group_inputs(raw: Any) -> List[str]:
         seen.add(key)
         urls.append(url)
     return urls
+
+
+def parse_raw_cookie_string(cookie_str: str) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """Parse a raw Facebook cookie string into Playwright cookie objects."""
+    cookies: List[Dict[str, Any]] = []
+    user_agent = None
+
+    parts = [part.strip() for part in (cookie_str or "").split(";") if part.strip()]
+    for part in parts:
+        if "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if not name:
+            continue
+        if name.lower() == "useragent":
+            try:
+                user_agent = base64.b64decode(value).decode("utf-8")
+            except Exception:
+                logger.warning("Could not decode UserAgent value from account cookie string.")
+            continue
+
+        cookies.append(
+            {
+                "name": name,
+                "value": value,
+                "domain": ".facebook.com",
+                "path": "/",
+                "secure": True,
+                "httpOnly": False,
+                "sameSite": "Lax",
+            }
+        )
+    return cookies, user_agent
 
 
 def parse_date_filter(raw: str) -> Optional[str]:
@@ -274,6 +310,7 @@ def load_scan_settings() -> Dict[str, Any]:
     return {
         "groups": normalize_group_inputs(groups),
         "time_windows": parse_time_windows(time_windows),
+        "accounts": split_text_lines(stored.get("accounts", [])),
         "max_posts": parse_positive_int(stored.get("max_posts", MAX_POSTS_DEFAULT), MAX_POSTS_DEFAULT),
         "include_comments": parse_bool(stored.get("include_comments"), False),
         "enabled": parse_bool(stored.get("enabled"), False),
@@ -358,17 +395,29 @@ class LeadScraper:
         self.user_agent = user_agent
         self.proxy_config = proxy_config
 
-    def _launch(self):
+    def _launch(self, cookie_str: Optional[str] = None):
         playwright = sync_playwright().start()
         browser = playwright.chromium.launch(
             headless=True,
             args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
         )
+
+        ua = self.user_agent
+        init_cookies = []
+        if cookie_str:
+            parsed_cookies, custom_ua = parse_raw_cookie_string(cookie_str)
+            init_cookies = parsed_cookies
+            if custom_ua:
+                ua = custom_ua
+
         context = browser.new_context(
-            user_agent=self.user_agent,
+            user_agent=ua,
             viewport={"width": 1366, "height": 768},
             proxy=self.proxy_config,
         )
+        if init_cookies:
+            context.add_cookies(init_cookies)
+
         page = context.new_page()
         return playwright, browser, context, page
 
@@ -426,12 +475,12 @@ class LeadScraper:
                 blocks.append({"selector": selector, "text": text})
         return self._dedupe(blocks)
 
-    def scrape(self, urls: Sequence[str], max_posts: int, include_comments: bool) -> Dict[str, Any]:
+    def scrape(self, urls: Sequence[str], max_posts: int, include_comments: bool, cookie_str: Optional[str] = None) -> Dict[str, Any]:
         results: List[Dict[str, Any]] = []
         visited_urls: List[str] = []
         ip_info: Optional[Dict[str, Any]] = None
         errors: List[Dict[str, str]] = []
-        playwright, browser, context, page = self._launch()
+        playwright, browser, context, page = self._launch(cookie_str=cookie_str)
 
         if VERIFY_PROXY:
             try:
@@ -442,8 +491,8 @@ class LeadScraper:
         try:
             for index, url in enumerate(urls, start=1):
                 try:
-                    page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                    page.wait_for_timeout(5000)
+                    logger.info("Scraping URL: %s", url)
+                    page.goto(url, wait_until="networkidle", timeout=60000)
                     for _ in range(2):
                         page.mouse.wheel(0, 2200)
                         page.wait_for_timeout(2500)
@@ -512,8 +561,16 @@ def build_scan_response(
     include_comments: bool,
     save: bool = False,
     debug: bool = False,
+    accounts: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    scraped = SCRAPER.scrape(urls=urls, max_posts=max_posts, include_comments=include_comments)
+    import random
+
+    cookie_str = None
+    if accounts:
+        cookie_str = random.choice(accounts)
+        logger.info("Using a random account from the configured account list.")
+
+    scraped = SCRAPER.scrape(urls=urls, max_posts=max_posts, include_comments=include_comments, cookie_str=cookie_str)
     leads, scanned_items_debug = classify_and_enrich(scraped["items"], save=save)
     rejected_items = [item for item in scanned_items_debug if not item.get("saved")]
     response: Dict[str, Any] = {
@@ -683,15 +740,17 @@ def dashboard_scan() -> Response:
     if auth:
         return auth
 
+    settings = load_scan_settings()
     urls = normalize_group_inputs(request.form.get("groups", ""))
     if not urls:
         return dashboard_redirect("Please enter at least one Facebook group UID, slug, or link.", "error")
 
+    accounts = settings.get("accounts", [])
     max_posts = parse_positive_int(request.form.get("max_posts", MAX_POSTS_DEFAULT), MAX_POSTS_DEFAULT)
     include_comments = parse_bool(request.form.get("include_comments"), False)
 
     try:
-        response = build_scan_response(urls, max_posts, include_comments, save=True, debug=True)
+        response = build_scan_response(urls, max_posts, include_comments, save=True, debug=True, accounts=accounts)
         app.config["LAST_SCAN_DEBUG"] = {
             "created_at": now_iso(),
             "visited_urls": response.get("visited_urls", []),
@@ -723,6 +782,7 @@ def dashboard_settings() -> Response:
     settings = {
         "groups": normalize_group_inputs(request.form.get("groups", "")),
         "time_windows": parse_time_windows(request.form.get("time_windows", "")),
+        "accounts": split_text_lines(request.form.get("accounts", "")),
         "max_posts": parse_positive_int(request.form.get("max_posts", MAX_POSTS_DEFAULT), MAX_POSTS_DEFAULT),
         "include_comments": parse_bool(request.form.get("include_comments"), False),
         "enabled": parse_bool(request.form.get("enabled"), False),
@@ -765,7 +825,14 @@ def scheduled_scan() -> Any:
     include_comments = parse_bool(settings.get("include_comments"), False)
 
     try:
-        response = build_scan_response(urls, max_posts, include_comments, save=True, debug=True)
+        response = build_scan_response(
+            urls,
+            max_posts,
+            include_comments,
+            save=True,
+            debug=True,
+            accounts=settings.get("accounts", []),
+        )
         response["scheduled"] = True
         response["schedule_reason"] = reason
         response["timezone"] = resolved_timezone
@@ -1046,6 +1113,9 @@ def dashboard() -> Response:
                   <label>Time windows
                     <textarea name="time_windows" class="wide" placeholder="08:00-11:30&#10;13:30-17:00">{{ settings_time_windows_text }}</textarea>
                   </label>
+                  <label>Accounts / Cookie Strings
+                    <textarea name="accounts" class="wide" placeholder="c_user=...; xs=...; fr=...&#10;c_user=...; xs=...; fr=...">{{ settings_accounts_text }}</textarea>
+                  </label>
                   <div class="form-row">
                     <label>Max posts
                       <input type="number" name="max_posts" min="1" max="1000" value="{{ settings.max_posts }}">
@@ -1121,6 +1191,7 @@ def dashboard() -> Response:
         settings=settings,
         settings_groups_text="\n".join(settings.get("groups", [])),
         settings_time_windows_text="\n".join(settings.get("time_windows", [])),
+        settings_accounts_text="\n".join(settings.get("accounts", [])),
         message=request.args.get("message", ""),
         message_level=request.args.get("level", ""),
         last_scan_debug=last_scan_debug,
